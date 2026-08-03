@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dynamics-predicter"
+version = "1.4.0"
+description = "IOWA+ORCHIDEA equal-log dynamic imputation with EB posterior intervals"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Luis M. Raimundo" }]
+dependencies = [
+  "numpy>=1.22",
+  "pandas>=1.5",
+  "openpyxl>=3.1",
+  "scipy>=1.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+dynamics-predicter = "dynamics_predicter.transfer:main"
+dynamics-predicter-gui = "dynamics_predicter.gui:main"
+
+[tool.setuptools.packages.find]
+include = ["dynamics_predicter*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
