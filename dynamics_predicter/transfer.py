@@ -6,7 +6,8 @@ Build a 10-level ladder (pppp…ffff) from measured anchors pp, mf, ff.
 
 Primary estimator: equal-log placement inside segments + segment-step outers.
 Optional: PCHIP polish on the three anchors only (Fritsch & Carlson), then
-evaluate at intermediate dynamic indices; outers stay equal-log/step.
+evaluate at intermediate dynamic indices; outers stay equal-log/step with
+optional geometric taper (v1.5). Third track: tanh_saturating in log space.
 
 No Philharmonia.
 
@@ -18,6 +19,8 @@ Scientific framing (see LITERATURE.md / README.md):
   - Model-based predictive intervals: bivariate normal on log-spans (D_lo, D_hi)
     with register partial pooling (Gelman & Hill), Monte Carlo pushforward through
     the equal-log ladder; outer-step ±20% kept as a separate sensitivity analysis
+  - Outer taper + saturating tanh track (Meyer 2009; Patterson 1974) — curvature
+    nuance in the same log space (no extra transform layer)
 """
 
 from __future__ import annotations
@@ -40,7 +43,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from scipy.interpolate import PchipInterpolator
 
-__version__ = "1.4.0"
+__version__ = "1.5.2.1"
 
 DYN_ORDER = ("pppp", "ppp", "pp", "p", "mp", "mf", "f", "ff", "fff", "ffff")
 DYN_LEVEL = {d: float(i) for i, d in enumerate(DYN_ORDER)}
@@ -53,6 +56,10 @@ UNIFORM_FRAC_HI = {"f": 0.5}
 N_STEPS_LO = 3  # pp → p → mp → mf
 N_STEPS_HI = 2  # mf → f → ff
 OUTER_SENSITIVITY = 0.20  # ±20% outer step size (sensitivity only, not CI)
+# Geometric taper on successive outer log-steps: offset_k = step * r^(k-1)
+# r=1.0 reproduces v1.4 bit-exactly; default 0.80 (Meyer dynamic-range compression).
+OUTER_TAPER_R = 0.80
+OUTER_TAPER_SENSITIVITY_RS = (0.7, 0.8, 0.9, 1.0)
 POOL_EPS = 1e-6  # shrink tiny segment steps toward corpus
 BOOTSTRAP_DEFAULT = 400
 RNG_SEED_DEFAULT = 20260801
@@ -65,6 +72,8 @@ DEFAULT_MEAS_RATIO = 0.35
 COV_RIDGE = 1e-6
 MIN_MODEL_N = 5
 INTERVAL_KIND = "eb_gaussian_posterior_pushforward"
+LADDER_MODE_EQUAL_LOG = "equal_log"
+LADDER_MODE_TANH = "tanh_saturating"
 
 # Acoustics-prior hyperparameters (literature-conditioned soft regularizer)
 ACOUSTICS_OUTER_SHRINK_MONO = 0.35  # blend toward positive corpus step when anchors monotone
@@ -137,6 +146,18 @@ ACOUSTICS_LITERATURE_RULES: list[dict[str, str]] = [
         "implementation": "pp, mf, ff remain exactly the IOWA+ORCHIDEA measurements on Results_acoustics_prior; only imputed/extrapolated cells are regularized.",
         "local_path": "",
     },
+    {
+        "rule_id": "R7_outer_taper_compression",
+        "authors_year": "Meyer (2009); Patterson (1974); Patterson & Green (related auditory compression)",
+        "work": "Acoustics and the Performance of Music (dynamic-range compression); auditory intensity coding / compressive transforms",
+        "claim": "Perceived and performance dynamic range is compressive: equal notated steps farther from the playable center contribute diminishing spectral/effort increments — not a second free SPL decade.",
+        "implementation": (
+            "Outer log-steps use geometric taper step·r^(k−1) with OUTER_TAPER_R=0.80 (internal_default); "
+            "r=1.0 reproduces v1.4 equal steps bit-exactly. R3 soft-cap remains a final guard; "
+            "when the taper alone keeps outers inside the cap, that is logged. Same log space — no new transform layer."
+        ),
+        "local_path": rf"{ACOUSTICS_BIBLIO_ROOT}\IMP_Acoustics and the Performance of music_(Jürgen Meyer) (z-lib.org).pdf",
+    },
 ]
 
 # Fallback layout for Violino_dinámicas.xlsx (0-based)
@@ -169,7 +190,17 @@ HEADER_ALIASES = {
     "tgt_ff": "ff",
     "iowa_ff": "ff",
     "orchidea_ff": "ff",
+    "prov_pp": "prov_pp",
+    "prov_mf": "prov_mf",
+    "prov_ff": "prov_ff",
+    "edge_filled_anchor": "edge_filled_anchor",
 }
+
+# Quality malus when panel anchors were filled upstream (extrapol_data --fill-panel)
+EDGE_FILLED_QUALITY_MALUS = 0.20
+INTERIOR_FILLED_QUALITY_MALUS = 0.10
+EDGE_FILLED_FLAG = "edge_filled_anchor"
+INTERIOR_FILLED_FLAG = "interior_filled_anchor"
 
 
 @dataclass
@@ -191,6 +222,9 @@ class NoteResult:
     target_pred_acoustics: dict[str, float] = field(default_factory=dict)
     acoustics_rules_applied: list[str] = field(default_factory=list)
     acoustics_notes: list[str] = field(default_factory=list)
+    # Third track: tanh_saturating in log space (never the default Results sheet)
+    target_pred_tanh: dict[str, float] = field(default_factory=dict)
+    tanh_fit: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -525,12 +559,19 @@ def ladder_values_from_anchors(
     *,
     use_pchip: bool = False,
     corpus_geom: dict[str, float] | None = None,
+    outer_taper_r: float = OUTER_TAPER_R,
+    ladder_mode: str = LADDER_MODE_EQUAL_LOG,
 ) -> dict[str, float]:
-    """Point ladder only (no intervals)."""
+    """Point ladder only (no intervals). ladder_mode: equal_log (default) | tanh_saturating."""
     tgt_log = {a: float(np.log(tgt_anchors[a])) for a in ANCHORS}
-    pred_log, _, _ = place_equal_log_ladder(tgt_log, corpus_geom=corpus_geom)
-    if use_pchip:
-        pred_log.update(pchip_intermediates_from_anchors(tgt_log))
+    if ladder_mode == LADDER_MODE_TANH:
+        pred_log, _, _ = place_tanh_saturating_ladder(tgt_log)
+    else:
+        pred_log, _, _ = place_equal_log_ladder(
+            tgt_log, corpus_geom=corpus_geom, outer_taper_r=outer_taper_r
+        )
+        if use_pchip:
+            pred_log.update(pchip_intermediates_from_anchors(tgt_log))
     for a in ANCHORS:
         pred_log[a] = tgt_log[a]
     return {d: float(np.exp(pred_log[d])) for d in DYN_ORDER}
@@ -546,6 +587,7 @@ def pushforward_predictive_intervals(
     n_draws: int = N_PUSHFORWARD_DRAWS,
     alpha: float = PRED_INTERVAL_ALPHA,
     seed: int = RNG_SEED_DEFAULT,
+    outer_taper_r: float = OUTER_TAPER_R,
 ) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
     """
     (1-α) intervals via conjugate EB posterior pushforward.
@@ -575,7 +617,12 @@ def pushforward_predictive_intervals(
             for d in DYN_ORDER:
                 samples[d][b] = np.nan
             continue
-        ladder = ladder_values_from_anchors(anchors_b, use_pchip=use_pchip, corpus_geom=corpus_geom)
+        ladder = ladder_values_from_anchors(
+            anchors_b,
+            use_pchip=use_pchip,
+            corpus_geom=corpus_geom,
+            outer_taper_r=outer_taper_r,
+        )
         for d in DYN_ORDER:
             samples[d][b] = ladder[d]
 
@@ -1235,11 +1282,56 @@ def load_panel_xlsx(
             rows = _rows_from_column_map(all_rows, legacy)
 
     df = pd.DataFrame(rows)
+    # Attach upstream fill-panel provenance when the workbook carries it
+    df = _attach_panel_provenance(df, path, sheet_key)
     errs = validate_panel_df(df)
     hard = [e for e in errs if not e.startswith("duplicate")]
     if hard:
         raise ValueError(f"Invalid panel {path.name}: " + "; ".join(hard))
     return df
+
+
+def _attach_panel_provenance(
+    df: pd.DataFrame,
+    path: Path,
+    sheet: str | int | None,
+) -> pd.DataFrame:
+    """Merge prov_pp/mf/ff and edge_filled_anchor from a headered Panel sheet if present."""
+    if df.empty:
+        return df
+    try:
+        raw = pd.read_excel(path, sheet_name=sheet if sheet is not None else 0)
+    except Exception:
+        return df
+    if raw is None or raw.empty:
+        return df
+    cols_l = {str(c).strip().lower(): c for c in raw.columns}
+    note_col = None
+    for cand in ("note", "note_target", "notas", "notes"):
+        if cand in cols_l:
+            note_col = cols_l[cand]
+            break
+    if note_col is None:
+        return df
+    want = ["prov_pp", "prov_mf", "prov_ff", "edge_filled_anchor", "estimator", "edge_k", "edge_taper_r", "cap_engaged"]
+    present = {w: cols_l[w] for w in want if w in cols_l}
+    # also accept Edge_K casing
+    if "edge_k" not in present:
+        for k, c in cols_l.items():
+            if k.replace(" ", "_") == "edge_k":
+                present["edge_k"] = c
+    if not present:
+        return df
+    meta = raw[[note_col] + list(present.values())].copy()
+    meta = meta.rename(columns={note_col: "note", **{v: k for k, v in present.items()}})
+    meta["note"] = meta["note"].astype(str).str.strip()
+    # Map edge_k → keep as edge_K for audit passthrough if needed
+    out = df.copy()
+    out["note_key"] = out["note"].astype(str).str.strip()
+    meta = meta.rename(columns={"note": "note_key"})
+    out = out.merge(meta, on="note_key", how="left")
+    out = out.drop(columns=["note_key"])
+    return out
 
 
 def target_distance_geometry(tgt_log: dict[str, float]) -> dict[str, float]:
@@ -1304,12 +1396,33 @@ def _pooled_steps(
     return step_lo, step_hi, w
 
 
+def tapered_outer_cum_offset(step: float, k: int, r: float = OUTER_TAPER_R) -> float:
+    """
+    Cumulative log-offset for the k-th outer level (k=1 → ppp/fff, k=2 → pppp/ffff).
+
+    Successive outer steps are step·r^(i−1); cumulative sum_{i=1..k} step·r^(i−1).
+    When r == 1.0 exactly, returns step*k (v1.4 bit-exact path).
+    """
+    if k <= 0:
+        return 0.0
+    if r == 1.0:
+        return float(step) * float(k)
+    # Geometric sum; r≠1
+    return float(step) * (1.0 - float(r) ** k) / (1.0 - float(r))
+
+
 def place_equal_log_ladder(
     tgt_log: dict[str, float],
     *,
     corpus_geom: dict[str, float] | None = None,
+    outer_taper_r: float = OUTER_TAPER_R,
 ) -> tuple[dict[str, float], dict[str, float], list[str]]:
-    """Place all 10 dynamics in log space from IOWA+ORCHIDEA segment lengths."""
+    """
+    Place all 10 dynamics in log space from IOWA+ORCHIDEA segment lengths.
+
+    Outer levels use tapered steps step·r^(k−1) (default r=OUTER_TAPER_R).
+    Pass outer_taper_r=1.0 for v1.4 bit-exact equal outer steps.
+    """
     warns = ["mode=iowa_orchidea_equal_log"]
     geom = target_distance_geometry(tgt_log)
     d_lo, d_hi = geom["D_lo_log"], geom["D_hi_log"]
@@ -1329,12 +1442,321 @@ def place_equal_log_ladder(
     audit["step_lo_log"] = float(step_lo)
     audit["step_hi_log"] = float(step_hi)
     audit["outer_pool_weight"] = float(pool_w)
-    out["ppp"] = tgt_log["pp"] - step_lo
-    out["pppp"] = tgt_log["pp"] - 2.0 * step_lo
-    out["fff"] = tgt_log["ff"] + step_hi
-    out["ffff"] = tgt_log["ff"] + 2.0 * step_hi
-    warns.append("outer_levels=segment_step_with_optional_corpus_pool")
+    audit["outer_taper_r"] = float(outer_taper_r)
+    # Soft side: subtract cumulative tapered offsets; loud side: add
+    if outer_taper_r == 1.0:
+        # v1.4 bit-exact branch (identical expressions)
+        out["ppp"] = tgt_log["pp"] - step_lo
+        out["pppp"] = tgt_log["pp"] - 2.0 * step_lo
+        out["fff"] = tgt_log["ff"] + step_hi
+        out["ffff"] = tgt_log["ff"] + 2.0 * step_hi
+        warns.append("outer_levels=segment_step_with_optional_corpus_pool")
+    else:
+        off_lo_1 = tapered_outer_cum_offset(step_lo, 1, outer_taper_r)
+        off_lo_2 = tapered_outer_cum_offset(step_lo, 2, outer_taper_r)
+        off_hi_1 = tapered_outer_cum_offset(step_hi, 1, outer_taper_r)
+        off_hi_2 = tapered_outer_cum_offset(step_hi, 2, outer_taper_r)
+        out["ppp"] = tgt_log["pp"] - off_lo_1
+        out["pppp"] = tgt_log["pp"] - off_lo_2
+        out["fff"] = tgt_log["ff"] + off_hi_1
+        out["ffff"] = tgt_log["ff"] + off_hi_2
+        warns.append(
+            f"outer_levels=segment_step_taper_r={outer_taper_r:.2f}_with_optional_corpus_pool"
+        )
+    audit["outer_off_lo_k1"] = float(tgt_log["pp"] - out["ppp"])
+    audit["outer_off_lo_k2"] = float(tgt_log["pp"] - out["pppp"])
+    audit["outer_off_hi_k1"] = float(out["fff"] - tgt_log["ff"])
+    audit["outer_off_hi_k2"] = float(out["ffff"] - tgt_log["ff"])
     return out, audit, warns
+
+
+def _brent_root(f, a: float, b: float, *, tol: float = 1e-14, maxiter: int = 200) -> float | None:
+    """Brent–Dekker root on [a,b] if f(a)*f(b)<=0; else None."""
+    fa, fb = f(a), f(b)
+    if not (np.isfinite(fa) and np.isfinite(fb)):
+        return None
+    if fa == 0.0:
+        return float(a)
+    if fb == 0.0:
+        return float(b)
+    if fa * fb > 0:
+        return None
+    # scipy-free Brent (Numerical Recipes style, compact)
+    x0, x1, x2 = a, b, a
+    f0, f1, f2 = fa, fb, fa
+    d = e = b - a
+    for _ in range(maxiter):
+        if f1 * f2 > 0:
+            x2, f2 = x0, f0
+            e = d = x1 - x0
+        if abs(f2) < abs(f1):
+            x0, x1, x2 = x1, x2, x1
+            f0, f1, f2 = f1, f2, f1
+        tol1 = 2.0 * tol * abs(x1) + 0.5 * tol
+        xm = 0.5 * (x2 - x1)
+        if abs(xm) <= tol1 or f1 == 0.0:
+            return float(x1)
+        if abs(e) >= tol1 and abs(f0) > abs(f1):
+            s = f1 / f0
+            if x0 == x2:
+                p = 2.0 * xm * s
+                q = 1.0 - s
+            else:
+                q = f0 / f2
+                r = f1 / f2
+                p = s * (2.0 * xm * q * (q - r) - (x1 - x0) * (r - 1.0))
+                q = (q - 1.0) * (r - 1.0) * (s - 1.0)
+            if p > 0:
+                q = -q
+            p = abs(p)
+            min1 = 3.0 * xm * q - abs(tol1 * q)
+            min2 = abs(e * q)
+            if 2.0 * p < min(min1, min2):
+                e = d
+                d = p / q
+            else:
+                d = xm
+                e = d
+        else:
+            d = xm
+            e = d
+        x0, f0 = x1, f1
+        x1 = x1 + d if abs(d) > tol1 else x1 + (tol1 if xm > 0 else -tol1)
+        f1 = f(x1)
+    return float(x1)
+
+
+TANH_ANCHOR_VERIFY_TOL = 1e-6  # log-space; re-pin absorbs only float dust
+# Near-flat log-span threshold (internal_default): one-sided |span| below this
+# makes the saturating curvature ratio ill-posed.
+TANH_NEAR_FLAT_TOL = 1e-12
+TANH_NA_REASON_NONMONO = "non-monotonic anchors"
+TANH_NA_REASON_FLAT = "near-flat segment (|span| < tol): saturating fit ill-posed"
+
+
+def _seg_sign(x: float) -> int:
+    if x > 0.0:
+        return 1
+    if x < 0.0:
+        return -1
+    return 0
+
+
+def classify_anchor_log_spans(
+    y_pp: float,
+    y_mf: float,
+    y_ff: float,
+    *,
+    tol: float = TANH_NEAR_FLAT_TOL,
+) -> str:
+    """
+    Shared span classification (log space) for quality flags and tanh guard.
+
+    Returns:
+      ``nonmono`` — strict opposite signs, both |span| ≥ tol
+      ``flat_one_sided`` — exactly one |span| < tol (ill-posed for saturating fit)
+      ``ok`` — same-sign spans, or both near-flat (constant ladder)
+    """
+    d_lo, d_hi = float(y_mf) - float(y_pp), float(y_ff) - float(y_mf)
+    lo_flat = abs(d_lo) < tol
+    hi_flat = abs(d_hi) < tol
+    if lo_flat ^ hi_flat:
+        return "flat_one_sided"
+    if (not lo_flat) and (not hi_flat) and _seg_sign(d_lo) != _seg_sign(d_hi):
+        return "nonmono"
+    return "ok"
+
+
+def _tanh_na_result(
+    y_pp: float,
+    y_mf: float,
+    y_ff: float,
+    reason: str,
+) -> tuple[dict[str, float], dict[str, float], list[str]]:
+    """Anchors kept; all non-anchor levels NaN (inapplicable saturating track)."""
+    out = {d: float("nan") for d in DYN_ORDER}
+    out["pp"], out["mf"], out["ff"] = float(y_pp), float(y_mf), float(y_ff)
+    is_nonmono = reason == TANH_NA_REASON_NONMONO
+    is_flat = reason == TANH_NA_REASON_FLAT
+    fit = {
+        "tanh_a": float("nan"),
+        "tanh_b": float("nan"),
+        "tanh_c": float("nan"),
+        "tanh_idx0": float("nan"),
+        "tanh_fit_ok": 0.0,
+        "tanh_anchor_err": float("nan"),
+        "tanh_method_code": -1.0,
+        "tanh_na": 1.0,
+        "tanh_na_nonmono": 1.0 if is_nonmono else 0.0,
+        "tanh_na_flat": 1.0 if is_flat else 0.0,
+        "tanh_near_flat_tol": float(TANH_NEAR_FLAT_TOL),
+    }
+    return out, fit, [f"mode={LADDER_MODE_TANH}", reason]
+
+
+def place_tanh_saturating_ladder(
+    tgt_log: dict[str, float],
+) -> tuple[dict[str, float], dict[str, float], list[str]]:
+    """
+    Third-track ladder: log y = a + b·tanh(c·(idx − idx0)) through pp/mf/ff.
+
+    Applicability (v1.5.2.1): before fitting,
+      • exactly one of |y_mf−y_pp|, |y_ff−y_mf| < TANH_NEAR_FLAT_TOL
+        → N/A, reason ``near-flat segment (|span| < tol): saturating fit ill-posed``;
+      • strict opposite nonzero signs → N/A, reason ``non-monotonic anchors``;
+      • both |span| < tol → allowed (flat ladder; linear/constant fit).
+    No fit / no corrective re-pin on N/A. ``n_tanh_na_nonmono`` tracks the
+    strict-opposite case and must match ``n_nonmonotonic_anchors``.
+
+    Construction when applicable:
+      1. Primary: idx0 = idx(mf), hence a = log(mf) (tanh(0)=0 → mf exact).
+      2. Solve 1-D for c from collinearity of the three anchors in (tanh, log y).
+      3. b closed-form; c→0 is the linear-in-index limit.
+      4. Evaluate the raw curve; **verify** anchors within 1e-6 in log space
+         (failure → same NaN path). Re-pinning may only absorb float dust.
+
+    Fallback when the mf-centered ratio is outside the tanh range: 1-D search over
+    idx0 ∈ (idx_pp, idx_ff). ladder_mode name: "tanh_saturating". Never default.
+    """
+    warns = [f"mode={LADDER_MODE_TANH}"]
+    idx_pp, idx_mf, idx_ff = DYN_LEVEL["pp"], DYN_LEVEL["mf"], DYN_LEVEL["ff"]
+    y_pp, y_mf, y_ff = float(tgt_log["pp"]), float(tgt_log["mf"]), float(tgt_log["ff"])
+
+    # --- applicability guard (before any fit); shared with quality nonmono flag ---
+    span_cls = classify_anchor_log_spans(y_pp, y_mf, y_ff)
+    if span_cls == "flat_one_sided":
+        return _tanh_na_result(y_pp, y_mf, y_ff, TANH_NA_REASON_FLAT)
+    if span_cls == "nonmono":
+        return _tanh_na_result(y_pp, y_mf, y_ff, TANH_NA_REASON_NONMONO)
+
+    def _raw_curve(a: float, b: float, c: float, idx0: float) -> dict[str, float]:
+        """Evaluate without touching anchors (verification is separate)."""
+        if c == 0.0:
+            return {d: float(a + b * (DYN_LEVEL[d] - idx0)) for d in DYN_ORDER}
+        return {
+            d: float(a + b * np.tanh(c * (DYN_LEVEL[d] - idx0))) for d in DYN_ORDER
+        }
+
+    def _fit_centered() -> tuple[float, float, float, float] | None:
+        idx0 = idx_mf
+        a = y_mf
+        d_pp, d_ff = idx_pp - idx0, idx_ff - idx0  # -3, +2
+        A, B = y_pp - a, y_ff - a
+        if abs(A) < 1e-15 and abs(B) < 1e-15:
+            return a, 0.0, 0.0, idx0
+
+        def g(c: float) -> float:
+            return float(A * np.tanh(c * d_ff) - B * np.tanh(c * d_pp))
+
+        lin_res = A * d_ff - B * d_pp
+        if abs(lin_res) < 1e-12:
+            beta = B / d_ff if abs(d_ff) > 1e-15 else (A / d_pp if abs(d_pp) > 1e-15 else 0.0)
+            return a, beta, 0.0, idx0
+
+        c_sol = None
+        for lo, hi in ((1e-9, 2.0), (-2.0, -1e-9), (2.0, 8.0), (-8.0, -2.0)):
+            c_sol = _brent_root(g, lo, hi)
+            if c_sol is not None:
+                break
+        if c_sol is None:
+            grid = np.concatenate(
+                [-np.geomspace(1e-6, 12.0, 40), np.geomspace(1e-6, 12.0, 40)]
+            )
+            gs = [g(float(c)) for c in grid]
+            for i in range(len(grid) - 1):
+                if not (np.isfinite(gs[i]) and np.isfinite(gs[i + 1])):
+                    continue
+                if gs[i] == 0.0:
+                    c_sol = float(grid[i])
+                    break
+                if gs[i] * gs[i + 1] <= 0:
+                    c_sol = _brent_root(g, float(grid[i]), float(grid[i + 1]))
+                    if c_sol is not None:
+                        break
+        if c_sol is None:
+            return None
+        th_ff = np.tanh(c_sol * d_ff)
+        th_pp = np.tanh(c_sol * d_pp)
+        if abs(th_ff) >= abs(th_pp) and abs(th_ff) > 1e-15:
+            b = B / th_ff
+        elif abs(th_pp) > 1e-15:
+            b = A / th_pp
+        else:
+            return None
+        return a, float(b), float(c_sol), float(idx0)
+
+    def _fit_free_idx0() -> tuple[float, float, float, float] | None:
+        best = None
+        best_err = np.inf
+        for idx0 in np.linspace(idx_pp + 0.05, idx_ff - 0.05, 61):
+            d_pp, d_mf, d_ff = idx_pp - idx0, idx_mf - idx0, idx_ff - idx0
+
+            def coll(c: float) -> float:
+                t_pp = np.tanh(c * d_pp)
+                t_mf = np.tanh(c * d_mf)
+                t_ff = np.tanh(c * d_ff)
+                return float((y_mf - y_pp) * (t_ff - t_pp) - (y_ff - y_pp) * (t_mf - t_pp))
+
+            c_sol = None
+            for lo, hi in ((1e-6, 3.0), (-3.0, -1e-6), (3.0, 10.0), (-10.0, -3.0)):
+                c_sol = _brent_root(coll, lo, hi)
+                if c_sol is not None:
+                    break
+            if c_sol is None:
+                continue
+            t_pp = np.tanh(c_sol * d_pp)
+            t_ff = np.tanh(c_sol * d_ff)
+            if abs(t_ff - t_pp) < 1e-15:
+                continue
+            b = (y_ff - y_pp) / (t_ff - t_pp)
+            a = y_pp - b * t_pp
+            y_mf_hat = a + b * np.tanh(c_sol * d_mf)
+            err = abs(y_mf_hat - y_mf)
+            if err < best_err:
+                best_err = err
+                best = (float(a), float(b), float(c_sol), float(idx0))
+                if err < 1e-12:
+                    break
+        return best
+
+    params = _fit_centered()
+    method = "idx0_at_mf_1d_c"
+    if params is None:
+        params = _fit_free_idx0()
+        method = "free_idx0_1d_c"
+    if params is None:
+        return _tanh_na_result(y_pp, y_mf, y_ff, "tanh_na_fit_failed")
+
+    a, b, c, idx0 = params
+    raw = _raw_curve(a, b, c, idx0)
+    if c == 0.0:
+        warns.append("tanh_degenerate_to_linear_in_index")
+
+    # Verification (not corrective re-pin): raw curve must hit anchors in log space
+    max_anchor_err = max(
+        abs(raw["pp"] - y_pp), abs(raw["mf"] - y_mf), abs(raw["ff"] - y_ff)
+    )
+    if max_anchor_err > TANH_ANCHOR_VERIFY_TOL:
+        return _tanh_na_result(y_pp, y_mf, y_ff, "tanh_na_anchor_verification_failed")
+
+    # Dust-only re-pin (anchors already within tol)
+    out = dict(raw)
+    out["pp"], out["mf"], out["ff"] = y_pp, y_mf, y_ff
+    fit = {
+        "tanh_a": float(a),
+        "tanh_b": float(b),
+        "tanh_c": float(c),
+        "tanh_idx0": float(idx0),
+        "tanh_fit_ok": 1.0,
+        "tanh_anchor_err": float(max_anchor_err),
+        "tanh_method_code": 1.0 if method.startswith("idx0_at_mf") else 2.0,
+        "tanh_na": 0.0,
+        "tanh_na_nonmono": 0.0,
+        "tanh_na_flat": 0.0,
+        "tanh_near_flat_tol": float(TANH_NEAR_FLAT_TOL),
+    }
+    warns.append(f"tanh_fit={method}")
+    return out, fit, warns
 
 
 def pchip_intermediates_from_anchors(tgt_log: dict[str, float]) -> dict[str, float]:
@@ -1345,12 +1767,17 @@ def pchip_intermediates_from_anchors(tgt_log: dict[str, float]) -> dict[str, flo
     return {d: float(spline(DYN_LEVEL[d])) for d in INTERPOLATED}
 
 
-def note_quality_and_flags(tgt_anchors: dict[str, float], geom: dict[str, float]) -> tuple[float, list[str]]:
+def note_quality_and_flags(
+    tgt_anchors: dict[str, float],
+    geom: dict[str, float],
+    *,
+    anchor_provenance: dict[str, str] | None = None,
+) -> tuple[float, list[str]]:
     flags: list[str] = []
     pp, mf, ff = tgt_anchors["pp"], tgt_anchors["mf"], tgt_anchors["ff"]
-    mono_up = pp <= mf <= ff
-    mono_down = pp >= mf >= ff
-    if not (mono_up or mono_down):
+    # Align with tanh guard: strict opposite log-spans (both |span| ≥ TANH_NEAR_FLAT_TOL)
+    span_cls = classify_anchor_log_spans(float(np.log(pp)), float(np.log(mf)), float(np.log(ff)))
+    if span_cls == "nonmono":
         flags.append("nonmonotonic_anchors")
     if geom["D_lo_log"] * geom["D_hi_log"] < 0:
         flags.append("opposite_segment_signs")
@@ -1358,6 +1785,12 @@ def note_quality_and_flags(tgt_anchors: dict[str, float], geom: dict[str, float]
         flags.append("near_zero_total_span")
     if min(pp, mf, ff) / max(pp, mf, ff) > 0.98:
         flags.append("flat_dynamic_span")
+
+    prov = {a: str((anchor_provenance or {}).get(a, "measured")).strip().lower() for a in ANCHORS}
+    if any(p == "edge_filled" for p in prov.values()):
+        flags.append(EDGE_FILLED_FLAG)
+    elif any(p == "interior_fill" for p in prov.values()):
+        flags.append(INTERIOR_FILLED_FLAG)
 
     q = 1.0
     if "nonmonotonic_anchors" in flags:
@@ -1368,10 +1801,29 @@ def note_quality_and_flags(tgt_anchors: dict[str, float], geom: dict[str, float]
         q -= 0.25
     if "flat_dynamic_span" in flags:
         q -= 0.10
+    if EDGE_FILLED_FLAG in flags:
+        q -= EDGE_FILLED_QUALITY_MALUS
+    elif INTERIOR_FILLED_FLAG in flags:
+        q -= INTERIOR_FILLED_QUALITY_MALUS
     # reward clear span
     span = abs(geom["D_total_log"])
     q += float(np.clip(span / 1.0, 0.0, 0.15))
     return float(np.clip(q, 0.05, 1.0)), flags
+
+
+def _anchor_kinds_from_provenance(anchor_provenance: dict[str, str] | None) -> dict[str, str]:
+    """Map upstream panel provenance → value_kind for anchors (SDA / hygiene)."""
+    kinds = {}
+    prov = anchor_provenance or {}
+    for a in ANCHORS:
+        p = str(prov.get(a, "measured")).strip().lower()
+        if p == "edge_filled":
+            kinds[a] = "edge_filled_anchor"
+        elif p == "interior_fill":
+            kinds[a] = "interior_filled_anchor"
+        else:
+            kinds[a] = "measured_anchor"
+    return kinds
 
 
 def _rising_teacher_outer_steps(
@@ -1423,12 +1875,14 @@ def acoustics_regularize_ladder(
     *,
     note_target: str = "",
     teacher_steps: dict[str, dict[int | None, float]] | None = None,
+    outer_taper_r: float = OUTER_TAPER_R,
 ) -> tuple[dict[str, float], list[str], list[str]]:
     """
     Literature-conditioned second track.
 
     Keeps measured anchors exact. Regularizes imputed/extrapolated cells using
     ACOUSTICS_LITERATURE_RULES (Schoonderwaldt, Schelleng, Meyer, Cremer/Guettler).
+    Outer steps use R7 geometric taper step·r^(k−1); R3 soft-cap is the final guard.
     """
     rules: list[str] = ["R6_anchors_inviolable"]
     notes: list[str] = []
@@ -1473,8 +1927,15 @@ def acoustics_regularize_ladder(
             "no global rising override of measured pp/mf/ff"
         )
 
-    # --- R2 + R4 + R5: outer steps ---
-    rules.extend(["R2_schelleng_control_region", "R4_helmholtz_corner_enrichment", "R5_register_modulation"])
+    # --- R2 + R4 + R5 + R7: outer steps with geometric taper ---
+    rules.extend(
+        [
+            "R2_schelleng_control_region",
+            "R4_helmholtz_corner_enrichment",
+            "R5_register_modulation",
+            "R7_outer_taper_compression",
+        ]
+    )
     octv = octave_from_note(note_target)
     teachers = teacher_steps or {"step_lo": {}, "step_hi": {}}
     teach_lo = teachers.get("step_lo", {}).get(octv)
@@ -1497,60 +1958,99 @@ def acoustics_regularize_ladder(
         pos_hi = max(float(teach_hi), ACOUSTICS_MIN_POS_STEP)
 
     shrink = ACOUSTICS_OUTER_SHRINK_MONO if mono_up else ACOUSTICS_OUTER_SHRINK_NONMONO
+    r = float(outer_taper_r)
+
+    def _apply_outers(step_lo_use: float, step_hi_use: float, *, rising: bool, soft: float, loud: float) -> None:
+        off_lo_1 = tapered_outer_cum_offset(step_lo_use, 1, r)
+        off_lo_2 = tapered_outer_cum_offset(step_lo_use, 2, r)
+        off_hi_1 = tapered_outer_cum_offset(step_hi_use, 1, r)
+        off_hi_2 = tapered_outer_cum_offset(step_hi_use, 2, r)
+        if rising:
+            pred["ppp"] = float(np.exp(np.log(soft) - off_lo_1))
+            pred["pppp"] = float(np.exp(np.log(soft) - off_lo_2))
+            pred["fff"] = float(np.exp(np.log(loud) + off_hi_1))
+            pred["ffff"] = float(np.exp(np.log(loud) + off_hi_2))
+        else:
+            pred["ppp"] = float(np.exp(np.log(soft) + off_lo_1))
+            pred["pppp"] = float(np.exp(np.log(soft) + off_lo_2))
+            pred["fff"] = float(np.exp(np.log(loud) - off_hi_1))
+            pred["ffff"] = float(np.exp(np.log(loud) - off_hi_2))
+
     if mono_up:
         # Continue enrichment beyond pp/ff (force↑ → brighter)
-        step_lo_use = (1.0 - shrink) * local_lo + shrink * pos_lo
-        step_hi_use = (1.0 - shrink) * local_hi + shrink * pos_hi
-        step_lo_use = abs(step_lo_use)
-        step_hi_use = abs(step_hi_use)
-        pred["ppp"] = float(np.exp(log_pp - step_lo_use))
-        pred["pppp"] = float(np.exp(log_pp - 2.0 * step_lo_use))
-        pred["fff"] = float(np.exp(log_ff + step_hi_use))
-        pred["ffff"] = float(np.exp(log_ff + 2.0 * step_hi_use))
-        notes.append(f"R2/R4/R5: outer enrichment steps shrink={shrink:.2f} (rising teachers/register)")
+        step_lo_use = abs((1.0 - shrink) * local_lo + shrink * pos_lo)
+        step_hi_use = abs((1.0 - shrink) * local_hi + shrink * pos_hi)
+        if r == 1.0:
+            pred["ppp"] = float(np.exp(log_pp - step_lo_use))
+            pred["pppp"] = float(np.exp(log_pp - 2.0 * step_lo_use))
+            pred["fff"] = float(np.exp(log_ff + step_hi_use))
+            pred["ffff"] = float(np.exp(log_ff + 2.0 * step_hi_use))
+        else:
+            _apply_outers(step_lo_use, step_hi_use, rising=True, soft=pp, loud=ff)
+        notes.append(
+            f"R2/R4/R5/R7: outer enrichment steps shrink={shrink:.2f} taper_r={r:.2f} (rising teachers/register)"
+        )
     elif mono_down:
         # Measured descent: continue soft/loud sides consistently but shrink magnitude (Schelleng caution)
         step_lo_use = (1.0 - shrink) * abs(local_lo) + shrink * pos_lo
         step_hi_use = (1.0 - shrink) * abs(local_hi) + shrink * pos_hi
-        pred["ppp"] = float(np.exp(log_pp + step_lo_use))
-        pred["pppp"] = float(np.exp(log_pp + 2.0 * step_lo_use))
-        pred["fff"] = float(np.exp(log_ff - step_hi_use))
-        pred["ffff"] = float(np.exp(log_ff - 2.0 * step_hi_use))
-        notes.append("R2: monotone-down anchors — outer continuation shrunk (do not amplify anomaly)")
+        if r == 1.0:
+            pred["ppp"] = float(np.exp(log_pp + step_lo_use))
+            pred["pppp"] = float(np.exp(log_pp + 2.0 * step_lo_use))
+            pred["fff"] = float(np.exp(log_ff - step_hi_use))
+            pred["ffff"] = float(np.exp(log_ff - 2.0 * step_hi_use))
+        else:
+            _apply_outers(step_lo_use, step_hi_use, rising=False, soft=pp, loud=ff)
+        notes.append(f"R2/R7: monotone-down anchors — outer continuation shrunk, taper_r={r:.2f}")
     else:
         # Inconsistent anchors: Schelleng — do not trust local segment for far extrapolation
-        # Bias soft side below min(pp,mf) and loud side above max(mf,ff) with positive enrichment steps
         rules.append("R2_schelleng_control_region")
         step_lo_use = (1.0 - shrink) * abs(local_lo) + shrink * pos_lo
         step_hi_use = (1.0 - shrink) * abs(local_hi) + shrink * pos_hi
         soft_anchor = min(pp, mf)
         loud_anchor = max(mf, ff)
-        pred["ppp"] = float(soft_anchor * np.exp(-step_lo_use))
-        pred["pppp"] = float(soft_anchor * np.exp(-2.0 * step_lo_use))
-        pred["fff"] = float(loud_anchor * np.exp(step_hi_use))
-        pred["ffff"] = float(loud_anchor * np.exp(2.0 * step_hi_use))
+        if r == 1.0:
+            pred["ppp"] = float(soft_anchor * np.exp(-step_lo_use))
+            pred["pppp"] = float(soft_anchor * np.exp(-2.0 * step_lo_use))
+            pred["fff"] = float(loud_anchor * np.exp(step_hi_use))
+            pred["ffff"] = float(loud_anchor * np.exp(2.0 * step_hi_use))
+        else:
+            _apply_outers(step_lo_use, step_hi_use, rising=True, soft=soft_anchor, loud=loud_anchor)
         notes.append(
-            "R2/R4: non-mono anchors — outers from soft/loud extremes with literature positive steps "
-            f"(shrink={shrink:.2f}); interiors not forced through a false global rise"
+            "R2/R4/R7: non-mono anchors — outers from soft/loud extremes with literature positive steps "
+            f"(shrink={shrink:.2f}, taper_r={r:.2f}); interiors not forced through a false global rise"
         )
 
-    # --- R3: soft-cap outer growth vs anchors (spectrum ≠ SPL) ---
+    # --- R3: soft-cap outer growth vs anchors (spectrum ≠ SPL); final guard after taper ---
     rules.append("R3_spectrum_not_spl")
+    soft_cap_applied = False
+    pre_cap = {d: pred[d] for d in ("pppp", "ppp", "fff", "ffff")}
     for d, center in (("ffff", ff), ("pppp", pp)):
         if center <= 0:
             continue
         ratio = pred[d] / center
         if ratio > ACOUSTICS_RATIO_SOFT_CAP:
             pred[d] = float(center * ACOUSTICS_RATIO_SOFT_CAP)
+            soft_cap_applied = True
             notes.append(f"R3: soft-capped {d}/anchor ratio at {ACOUSTICS_RATIO_SOFT_CAP}")
         elif ratio < 1.0 / ACOUSTICS_RATIO_SOFT_CAP:
             pred[d] = float(center / ACOUSTICS_RATIO_SOFT_CAP)
+            soft_cap_applied = True
             notes.append(f"R3: soft-capped {d}/anchor inverse ratio at {ACOUSTICS_RATIO_SOFT_CAP}")
     # also cap fff/ppp mildly relative to ff/pp
-    if pred["fff"] / ff > ACOUSTICS_RATIO_SOFT_CAP:
+    if ff > 0 and pred["fff"] / ff > ACOUSTICS_RATIO_SOFT_CAP:
         pred["fff"] = float(ff * np.sqrt(ACOUSTICS_RATIO_SOFT_CAP))
-    if pp / pred["ppp"] > ACOUSTICS_RATIO_SOFT_CAP:
+        soft_cap_applied = True
+        notes.append(f"R3: soft-capped fff/ff at sqrt({ACOUSTICS_RATIO_SOFT_CAP})")
+    if pred["ppp"] > 0 and pp / pred["ppp"] > ACOUSTICS_RATIO_SOFT_CAP:
         pred["ppp"] = float(pp / np.sqrt(ACOUSTICS_RATIO_SOFT_CAP))
+        soft_cap_applied = True
+        notes.append(f"R3: soft-capped pp/ppp at sqrt({ACOUSTICS_RATIO_SOFT_CAP})")
+    if not soft_cap_applied:
+        notes.append(
+            f"R3: taper alone sufficed (r={r:.2f}; no soft-cap applied; "
+            f"pre_cap pppp={pre_cap['pppp']:.6g}, ffff={pre_cap['ffff']:.6g})"
+        )
 
     # Final: anchors exact
     for a in ANCHORS:
@@ -1576,6 +2076,8 @@ def transfer_one_note(
     interval_alpha: float = PRED_INTERVAL_ALPHA,
     seed: int = RNG_SEED_DEFAULT,
     teacher_steps: dict[str, dict[int | None, float]] | None = None,
+    outer_taper_r: float = OUTER_TAPER_R,
+    anchor_provenance: dict[str, str] | None = None,
 ) -> NoteResult:
     warns: list[str] = []
     empty = {d: float("nan") for d in DYN_ORDER}
@@ -1596,7 +2098,9 @@ def transfer_one_note(
         )
 
     tgt_log = {a: float(np.log(tgt_anchors[a])) for a in ANCHORS}
-    pred_log, audit, w = place_equal_log_ladder(tgt_log, corpus_geom=corpus_geom)
+    pred_log, audit, w = place_equal_log_ladder(
+        tgt_log, corpus_geom=corpus_geom, outer_taper_r=outer_taper_r
+    )
     warns.extend(w)
 
     if use_pchip:
@@ -1609,9 +2113,16 @@ def transfer_one_note(
     for a in ANCHORS:
         pred_log[a] = tgt_log[a]
 
-    quality, flags = note_quality_and_flags(tgt_anchors, audit)
+    quality, flags = note_quality_and_flags(
+        tgt_anchors, audit, anchor_provenance=anchor_provenance,
+    )
     if flags:
         warns.extend(flags)
+    if EDGE_FILLED_FLAG in flags:
+        warns.append("upstream_panel=edge_filled_anchors")
+        audit["edge_filled_anchor"] = 1.0
+    else:
+        audit["edge_filled_anchor"] = 0.0
 
     pred = {d: float(np.exp(pred_log[d])) for d in DYN_ORDER}
     for a in ANCHORS:
@@ -1629,6 +2140,7 @@ def transfer_one_note(
             n_draws=n_pushforward,
             alpha=interval_alpha,
             seed=seed + (abs(hash(note_for_oct)) % 10007),
+            outer_taper_r=outer_taper_r,
         )
         audit.update(imeta)
         interval_kind = INTERVAL_KIND
@@ -1640,9 +2152,10 @@ def transfer_one_note(
         warns.append("intervals=unavailable_no_span_model")
 
     kinds = {}
+    anchor_kinds = _anchor_kinds_from_provenance(anchor_provenance)
     for d in DYN_ORDER:
         if d in ANCHORS:
-            kinds[d] = "measured_anchor"
+            kinds[d] = anchor_kinds[d]
         elif d in INTERPOLATED:
             kinds[d] = "interpolated"
         else:
@@ -1653,8 +2166,22 @@ def transfer_one_note(
         pred,
         note_target=note_target or note,
         teacher_steps=teacher_steps,
+        outer_taper_r=outer_taper_r,
     )
     warns.append("acoustics_prior=literature_regularized_second_track")
+
+    tanh_log, tanh_fit, tanh_warns = place_tanh_saturating_ladder(tgt_log)
+    warns.extend(tanh_warns)
+    tanh_pred: dict[str, float] = {}
+    for d in DYN_ORDER:
+        if d in ANCHORS:
+            # Anchors always the measured linear values (inapplicable track keeps them)
+            tanh_pred[d] = float(tgt_anchors[d])
+        elif not np.isfinite(tanh_log.get(d, float("nan"))):
+            tanh_pred[d] = float("nan")
+        else:
+            tanh_pred[d] = float(np.exp(tanh_log[d]))
+    warns.append("tanh_saturating=third_track_not_default")
 
     return NoteResult(
         note=note,
@@ -1668,11 +2195,13 @@ def transfer_one_note(
         warnings=warns,
         quality=quality,
         flags=flags,
-        audit=audit,
+        audit={**audit, **{k: v for k, v in tanh_fit.items() if isinstance(v, (int, float))}},
         interval_kind=interval_kind,
         target_pred_acoustics=ac_pred,
         acoustics_rules_applied=ac_rules,
         acoustics_notes=ac_notes,
+        target_pred_tanh=tanh_pred,
+        tanh_fit=tanh_fit,
     )
 
 
@@ -1711,6 +2240,15 @@ def run_transfer(
                 )
             )
             continue
+        prov = {}
+        for a in ANCHORS:
+            key = f"prov_{a}"
+            if key in r.index and pd.notna(r.get(key)):
+                prov[a] = str(r.get(key)).strip().lower()
+        if r.get("edge_filled_anchor") in (1, 1.0, True, "1", "true", "True"):
+            # Row-level flag from extrapol_data --fill-panel
+            for a in ANCHORS:
+                prov.setdefault(a, "edge_filled")
         results.append(
             transfer_one_note(
                 {a: float(tgt[a]) for a in ANCHORS},
@@ -1723,6 +2261,7 @@ def run_transfer(
                 interval_alpha=interval_alpha,
                 seed=seed + i,
                 teacher_steps=teacher_steps,
+                anchor_provenance=prov or None,
             )
         )
     return results
@@ -2001,28 +2540,33 @@ def outer_step_sensitivity_bands(
     *,
     corpus_geom: dict[str, float] | None = None,
     delta: float = OUTER_SENSITIVITY,
+    outer_taper_r: float = OUTER_TAPER_R,
 ) -> dict[str, tuple[float, float, float]]:
     """
     Deterministic ±delta sensitivity on outer log-steps (NOT a probabilistic CI).
     Returns dynamic -> (point, lo, hi) in linear metric space.
+    Uses the same tapered cumulative offsets as place_equal_log_ladder.
     """
     tgt_log = {a: float(np.log(tgt_anchors[a])) for a in ANCHORS}
-    pred_log, audit, _ = place_equal_log_ladder(tgt_log, corpus_geom=corpus_geom)
+    pred_log, audit, _ = place_equal_log_ladder(
+        tgt_log, corpus_geom=corpus_geom, outer_taper_r=outer_taper_r
+    )
     step_lo = float(audit["step_lo_log"])
     step_hi = float(audit["step_hi_log"])
+    r = float(outer_taper_r)
     out: dict[str, tuple[float, float, float]] = {}
     for name, center, step, k in (
-        ("ppp", tgt_log["pp"], step_lo, 1.0),
-        ("pppp", tgt_log["pp"], step_lo, 2.0),
-        ("fff", tgt_log["ff"], step_hi, 1.0),
-        ("ffff", tgt_log["ff"], step_hi, 2.0),
+        ("ppp", tgt_log["pp"], step_lo, 1),
+        ("pppp", tgt_log["pp"], step_lo, 2),
+        ("fff", tgt_log["ff"], step_hi, 1),
+        ("ffff", tgt_log["ff"], step_hi, 2),
     ):
-        s_a = step * (1.0 - delta)
-        s_b = step * (1.0 + delta)
+        off_a = tapered_outer_cum_offset(step * (1.0 - delta), k, r)
+        off_b = tapered_outer_cum_offset(step * (1.0 + delta), k, r)
         if name in ("ppp", "pppp"):
-            lo_l, hi_l = center - k * s_b, center - k * s_a
+            lo_l, hi_l = center - off_b, center - off_a
         else:
-            lo_l, hi_l = center + k * s_a, center + k * s_b
+            lo_l, hi_l = center + off_a, center + off_b
         lo_l, hi_l = min(lo_l, hi_l), max(lo_l, hi_l)
         out[name] = (float(np.exp(pred_log[name])), float(np.exp(lo_l)), float(np.exp(hi_l)))
     return out
@@ -2033,8 +2577,12 @@ def outer_sensitivity_table(
     df: pd.DataFrame | None = None,
     *,
     delta: float = OUTER_SENSITIVITY,
+    taper_rs: Sequence[float] = OUTER_TAPER_SENSITIVITY_RS,
 ) -> pd.DataFrame:
-    """Separate sensitivity analysis for outers (±delta on step size)."""
+    """
+    Separate sensitivity analysis for outers (±delta on step size) plus
+    columns for outer taper r ∈ taper_rs so the taper choice is visibly bounded.
+    """
     corpus_geom = corpus_target_distance_summary(df) if df is not None else None
     rows = []
     for res in results:
@@ -2043,21 +2591,42 @@ def outer_sensitivity_table(
         bands = outer_step_sensitivity_bands(
             res.target_measured, corpus_geom=corpus_geom, delta=delta
         )
+        tgt_log = {a: float(np.log(res.target_measured[a])) for a in ANCHORS}
+        taper_preds: dict[float, dict[str, float]] = {}
+        for r in taper_rs:
+            plog, _, _ = place_equal_log_ladder(
+                tgt_log, corpus_geom=corpus_geom, outer_taper_r=float(r)
+            )
+            taper_preds[float(r)] = {d: float(np.exp(plog[d])) for d in EXTRAPOLATED_BEYOND}
         for d in EXTRAPOLATED_BEYOND:
             point, lo, hi = bands[d]
-            rows.append(
-                {
-                    "note": res.note_target or res.note,
-                    "dynamic": d,
-                    "pred": point,
-                    "sens_lo": lo,
-                    "sens_hi": hi,
-                    "rel_halfwidth": abs(hi - lo) / (2.0 * point) if point else np.nan,
-                    "sensitivity": delta,
-                    "band_type": "outer_step_sensitivity_not_CI",
-                    "claim_strength": "weak_extrapolation",
-                }
-            )
+            row = {
+                "note": res.note_target or res.note,
+                "dynamic": d,
+                "pred": point,
+                "sens_lo": lo,
+                "sens_hi": hi,
+                "rel_halfwidth": abs(hi - lo) / (2.0 * point) if point else np.nan,
+                "sensitivity": delta,
+                "band_type": "outer_step_sensitivity_not_CI",
+                "claim_strength": "weak_extrapolation",
+                "outer_taper_r_default": OUTER_TAPER_R,
+            }
+            for r in taper_rs:
+                key = f"pred_r{str(r).replace('.', '')}"
+                # 0.7 → pred_r07; 1.0 → pred_r10
+                if r == 1.0:
+                    key = "pred_r1.0"
+                elif r == 0.7:
+                    key = "pred_r0.7"
+                elif r == 0.8:
+                    key = "pred_r0.8"
+                elif r == 0.9:
+                    key = "pred_r0.9"
+                else:
+                    key = f"pred_r{r}"
+                row[key] = taper_preds[float(r)][d]
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -2074,6 +2643,10 @@ def results_to_dataframe(results: list[NoteResult]) -> pd.DataFrame:
             "warnings": "; ".join(res.warnings),
             "acoustics_rules": "; ".join(res.acoustics_rules_applied),
             "acoustics_notes": "; ".join(res.acoustics_notes),
+            "edge_filled_anchor": bool(
+                EDGE_FILLED_FLAG in (res.flags or [])
+                or float((res.audit or {}).get("edge_filled_anchor", 0.0) or 0.0) >= 0.5
+            ),
         }
         for d in DYN_ORDER:
             row[f"pred_{d}"] = res.target_pred.get(d)
@@ -2081,6 +2654,7 @@ def results_to_dataframe(results: list[NoteResult]) -> pd.DataFrame:
             row[f"pred_hi_{d}"] = res.pred_hi.get(d)
             row[f"value_kind_{d}"] = res.value_kind.get(d, "")
             row[f"acoustics_{d}"] = (res.target_pred_acoustics or {}).get(d)
+            row[f"tanh_{d}"] = (res.target_pred_tanh or {}).get(d)
         for a in ANCHORS:
             row[f"measured_{a}"] = res.target_measured.get(a)
         for k, v in (res.audit or {}).items():
@@ -2106,7 +2680,18 @@ def _limitations_df() -> pd.DataFrame:
             },
             {
                 "topic": "outers",
-                "statement": "pppp, ppp, fff, ffff are extrapolated via segment log-steps; weakest claim. See Sensitivity_outer (±20% steps) separately from model CIs.",
+                "statement": "pppp, ppp, fff, ffff are extrapolated via tapered segment log-steps (step·r^(k−1), default r=0.80; r=1.0 = v1.4). Weakest claim. See Sensitivity_outer (±20% steps and r∈{0.7,0.8,0.9,1.0}) separately from model CIs.",
+            },
+            {
+                "topic": "tanh_track",
+                "statement": (
+                    "Results_tanh is a THIRD track (ladder_mode=tanh_saturating): "
+                    "log y = a + b·tanh(c·(idx−idx0)) when spans are same-sign and not "
+                    "one-sided near-flat. N/A reasons: 'non-monotonic anchors' | "
+                    "'near-flat segment (|span| < tol)' (tol=TANH_NEAR_FLAT_TOL). "
+                    "Run_meta: n_tanh_na_nonmono ≡ n_nonmonotonic_anchors; n_tanh_na_flat; "
+                    "n_tanh_na = sum. Never the default."
+                ),
             },
             {
                 "topic": "intervals",
@@ -2114,7 +2699,13 @@ def _limitations_df() -> pd.DataFrame:
             },
             {
                 "topic": "metric",
-                "statement": "EWSD-like spectral-density score ≠ SPL and ≠ spectral centroid; non-monotonic anchors are common.",
+                "statement": (
+                    "EWSD-like spectral-density / CDM score ≠ SPL and ≠ spectral centroid. "
+                    "Empirically non-monotone in dynamics for bowed strings (cello corpus: "
+                    "33/49 notes with ff<mf; median R_ff/mf ≈ 0.94). Soft→loud monotonicity "
+                    "is a hygiene rule for broken model extrapolation on imputed/extrapolated "
+                    "cells only — not a physical law, and never a reason to overwrite measured pp/mf/ff."
+                ),
             },
             {
                 "topic": "holdout",
@@ -2130,7 +2721,7 @@ def _limitations_df() -> pd.DataFrame:
             },
             {
                 "topic": "acoustics_prior_sheet",
-                "statement": "Results_acoustics_prior is a literature-conditioned SECOND TRACK grounded primarily in Rossing (ed.) The Science of String Instruments, plus Schoonderwaldt/Schelleng/Meyer/Cremer/Benade/Chaigne. It does not overwrite measured pp/mf/ff. Prefer Results for data-faithful imputation; use Results_acoustics_prior only when a force→brightness soft prior is desired.",
+                "statement": "Results_acoustics_prior is a literature-conditioned SECOND TRACK grounded primarily in Rossing (ed.) The Science of String Instruments, plus Schoonderwaldt/Schelleng/Meyer/Cremer/Benade/Chaigne (R0–R7). It does not overwrite measured pp/mf/ff. Prefer Results for data-faithful imputation; use Results_acoustics_prior only when a force→brightness soft prior is desired.",
             },
         ]
     )
@@ -2214,12 +2805,16 @@ def build_run_meta(
         "collections": "IOWA+ORCHIDEA only (Philharmonia removed)",
         "n_rows": int(len(df)),
         "n_ok": int(sum(1 for r in results if r.status == "ok")),
-        "use_pchip_default_false": True,
+        "use_pchip_default_false_cli": True,
+        "use_pchip_default_true_gui": True,
         "use_pchip": use_pchip,
         "interval_kind": INTERVAL_KIND,
         "interval_alpha": PRED_INTERVAL_ALPHA,
         "n_pushforward_draws": N_PUSHFORWARD_DRAWS,
         "outer_sensitivity_not_CI": OUTER_SENSITIVITY,
+        "outer_taper_r_default": OUTER_TAPER_R,
+        "outer_taper_sensitivity_rs": list(OUTER_TAPER_SENSITIVITY_RS),
+        "ladder_modes": [LADDER_MODE_EQUAL_LOG, "acoustics_prior", LADDER_MODE_TANH],
         "span_model": span_model.summary() if span_model is not None else {},
         "span_model_calibration_loo": calibration or {},
         "corpus_target_distances": corpus_target_distance_summary(df),
@@ -2242,6 +2837,49 @@ def build_run_meta(
         "python": platform.python_version(),
         "platform": platform.platform(),
     }
+    n_tanh_na_nonmono = int(
+        sum(
+            1
+            for r in results
+            if r.status == "ok"
+            and (
+                (r.tanh_fit or {}).get("tanh_na_nonmono", 0.0) == 1.0
+                or TANH_NA_REASON_NONMONO in (r.warnings or [])
+            )
+        )
+    )
+    n_tanh_na_flat = int(
+        sum(
+            1
+            for r in results
+            if r.status == "ok"
+            and (
+                (r.tanh_fit or {}).get("tanh_na_flat", 0.0) == 1.0
+                or TANH_NA_REASON_FLAT in (r.warnings or [])
+            )
+        )
+    )
+    n_tanh_na_other = int(
+        sum(
+            1
+            for r in results
+            if r.status == "ok"
+            and (r.tanh_fit or {}).get("tanh_na", 0.0) == 1.0
+            and (r.tanh_fit or {}).get("tanh_na_nonmono", 0.0) != 1.0
+            and (r.tanh_fit or {}).get("tanh_na_flat", 0.0) != 1.0
+        )
+    )
+    meta["n_tanh_na_nonmono"] = n_tanh_na_nonmono
+    meta["n_tanh_na_flat"] = n_tanh_na_flat
+    meta["n_tanh_na"] = n_tanh_na_nonmono + n_tanh_na_flat + n_tanh_na_other
+    meta["tanh_near_flat_tol"] = float(TANH_NEAR_FLAT_TOL)
+    # Reconcile: strict-opposite tanh refusals ≡ quality nonmonotonic_anchors flag
+    if meta["n_tanh_na_nonmono"] != meta["n_nonmonotonic_anchors"]:
+        raise AssertionError(
+            "n_tanh_na_nonmono (%d) != n_nonmonotonic_anchors (%d); "
+            "tanh guard and quality flag must not drift"
+            % (meta["n_tanh_na_nonmono"], meta["n_nonmonotonic_anchors"])
+        )
     src = Path(source)
     if src.is_file():
         meta["source_sha256"] = file_sha256(src)
@@ -2292,6 +2930,9 @@ def _apply_results_highlighting(workbook) -> None:
             elif "literature second" in item or "acoustics rule" in item:
                 for c in range(1, 4):
                     ws.cell(r, c).fill = _style_fill("E2D5F1")  # light purple
+            elif "tanh" in item or "third track" in item:
+                for c in range(1, 4):
+                    ws.cell(r, c).fill = _style_fill("F8CBAD")  # light terracotta
         ws.column_dimensions["A"].width = 28
         ws.column_dimensions["B"].width = 56
         ws.column_dimensions["C"].width = 48
@@ -2338,6 +2979,10 @@ def _apply_results_highlighting(workbook) -> None:
         ws = workbook["Results_acoustics_prior"]
         if "acoustics_notes" in {c.value for c in ws[1]}:
             ws.column_dimensions["O"].width = 48
+
+    # --- Results_tanh (third track; never default) ---
+    if "Results_tanh" in workbook.sheetnames:
+        _paint_dyn_sheet(workbook["Results_tanh"], tab_rgb="C65911")
 
     if "Acoustics_prior_rules" in workbook.sheetnames:
         ws = workbook["Acoustics_prior_rules"]
@@ -2402,12 +3047,15 @@ def export_excel(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pred_df = results_to_dataframe(results)
 
-    # Clean everyday sheet: only the values to use
+    # Clean everyday sheet: values + per-cell value_kind (SDA import / hygiene)
     results_df = pred_df[["note", "note_target", "status"]].copy()
+    if "edge_filled_anchor" in pred_df.columns:
+        results_df["edge_filled_anchor"] = pred_df["edge_filled_anchor"]
     for d in DYN_ORDER:
         results_df[d] = pred_df[f"pred_{d}"]
+        results_df[f"kind_{d}"] = pred_df[f"value_kind_{d}"]
 
-    wide_cols = ["note", "note_target", "status", "quality", "flags"]
+    wide_cols = ["note", "note_target", "status", "quality", "flags", "edge_filled_anchor"]
     for d in DYN_ORDER:
         wide_cols += [f"pred_{d}", f"pred_lo_{d}", f"pred_hi_{d}", f"value_kind_{d}"]
     wide = pred_df[[c for c in wide_cols if c in pred_df.columns]].copy()
@@ -2419,7 +3067,10 @@ def export_excel(
         rename[f"value_kind_{d}"] = f"kind_{d}"
     wide = wide.rename(columns=rename)
 
-    measured = pred_df[["note", "note_target", "status", "quality"] + [f"measured_{a}" for a in ANCHORS]].copy()
+    mcols = ["note", "note_target", "status", "quality"]
+    if "edge_filled_anchor" in pred_df.columns:
+        mcols.append("edge_filled_anchor")
+    measured = pred_df[mcols + [f"measured_{a}" for a in ANCHORS]].copy()
     measured = measured.rename(columns={f"measured_{a}": a for a in ANCHORS})
 
     interp = pred_df[["note", "note_target", "status"]].copy()
@@ -2455,9 +3106,10 @@ def export_excel(
     meta_df = pd.DataFrame(
         [{"key": k, "value": json.dumps(v) if isinstance(v, (dict, list)) else str(v)} for k, v in meta.items()]
     )
-    quality_df = pred_df[
-        ["note", "note_target", "status", "quality", "flags", "warnings"]
-    ].sort_values("quality")
+    qcols = ["note", "note_target", "status", "quality", "flags", "warnings"]
+    if "edge_filled_anchor" in pred_df.columns:
+        qcols.insert(4, "edge_filled_anchor")
+    quality_df = pred_df[[c for c in qcols if c in pred_df.columns]].sort_values("quality")
 
     sens = sensitivity_df if sensitivity_df is not None else outer_sensitivity_table(results)
 
@@ -2473,6 +3125,39 @@ def export_excel(
     ac_df["acoustics_rules"] = pred_df["acoustics_rules"]
     ac_df["acoustics_notes"] = pred_df["acoustics_notes"]
 
+    # Third track (terracotta): tanh_saturating (monotone-anchor notes only; N/A → blank)
+    # Re-check counters at export so they cannot drift from build_run_meta
+    if "n_tanh_na_nonmono" in meta and "n_nonmonotonic_anchors" in meta:
+        if int(meta["n_tanh_na_nonmono"]) != int(meta["n_nonmonotonic_anchors"]):
+            raise AssertionError(
+                "export: n_tanh_na_nonmono (%s) != n_nonmonotonic_anchors (%s)"
+                % (meta["n_tanh_na_nonmono"], meta["n_nonmonotonic_anchors"])
+            )
+    tanh_df = pred_df[["note", "note_target", "status"]].copy()
+    for d in DYN_ORDER:
+        tanh_df[d] = pred_df[f"tanh_{d}"]
+    tanh_notes: list[str] = []
+    for res in results:
+        note = ""
+        if res.status == "ok":
+            for w in res.warnings or []:
+                if w in (TANH_NA_REASON_NONMONO, TANH_NA_REASON_FLAT):
+                    note = f"saturating model inapplicable: {w}"
+                    break
+                if isinstance(w, str) and w.startswith("tanh_na_"):
+                    note = f"saturating model inapplicable: {w}"
+                    break
+        tanh_notes.append(note)
+    # Pad if results/pred_df length mismatch (skipped rows already in pred_df)
+    while len(tanh_notes) < len(tanh_df):
+        tanh_notes.append("")
+    tanh_df["tanh_note"] = tanh_notes[: len(tanh_df)]
+
+    pchip_on = bool(meta.get("use_pchip", False))
+    interior_geom = "PCHIP on 3 anchors" if pchip_on else "equal-log fractions (p⅓, mp⅔, f½)"
+    n_tanh_na = int(meta.get("n_tanh_na", 0) or 0)
+    n_tanh_na_nonmono = int(meta.get("n_tanh_na_nonmono", 0) or 0)
+    n_tanh_na_flat = int(meta.get("n_tanh_na_flat", 0) or 0)
     guide = pd.DataFrame(
         [
             {
@@ -2483,12 +3168,21 @@ def export_excel(
             {
                 "item": "Primary sheet",
                 "detail": "Results (green tab) — data-faithful imputation",
-                "columns_or_notes": "note, note_target, status, pppp ... ffff",
+                "columns_or_notes": (
+                    f"geometry: interiors={interior_geom}; "
+                    f"outers=tapered equal-log (r={OUTER_TAPER_R} default; r=1.0=v1.4); "
+                    f"this run use_pchip={pchip_on}"
+                ),
             },
             {
                 "item": "Main columns on Results",
-                "detail": "The 10 dynamic values",
-                "columns_or_notes": "pppp, ppp, pp, p, mp, mf, f, ff, fff, ffff",
+                "detail": "The 10 dynamic values + kind_* per cell",
+                "columns_or_notes": (
+                    "pppp…ffff values; kind_* = measured_anchor|interior_filled_anchor|edge_filled_anchor|"
+                    "interpolated|extrapolated_beyond; edge_filled_anchor column flags upstream "
+                    "extrapol_data --fill-panel edges (SDA import / hygiene — true lab anchors inviolable; "
+                    "CDM not soft→loud by law)"
+                ),
             },
             {
                 "item": "Colour key - yellow",
@@ -2508,12 +3202,37 @@ def export_excel(
             {
                 "item": "Literature second track",
                 "detail": "Results_acoustics_prior (purple tab)",
-                "columns_or_notes": "same 10 levels; primary book Rossing The Science of String Instruments + Schelleng/Meyer/Benade; anchors unchanged",
+                "columns_or_notes": (
+                    "geometry: equal-log interiors + literature outer shrink/taper (R0–R7); "
+                    "anchors unchanged; primary book Rossing The Science of String Instruments"
+                ),
             },
             {
                 "item": "Acoustics rule list",
                 "detail": "Acoustics_prior_rules (purple tab)",
-                "columns_or_notes": "R0–R6; primary local PDF: Thomas D. Rossing_The Science of String Instruments.pdf",
+                "columns_or_notes": "R0–R7; R7=outer taper (Meyer 2009 + Patterson 1974); primary local PDF: Thomas D. Rossing_The Science of String Instruments.pdf",
+            },
+            {
+                "item": "Third track (tanh)",
+                "detail": "Results_tanh — ladder_mode=tanh_saturating (never default)",
+                "columns_or_notes": (
+                    "Covers monotone-anchor notes only by design (same-sign pp→mf and mf→ff). "
+                    "N/A reasons: 'non-monotonic anchors' | "
+                    f"'near-flat segment (|span| < tol)' with tol={TANH_NEAR_FLAT_TOL:g} (internal_default). "
+                    f"this run n_tanh_na={n_tanh_na} "
+                    f"(nonmono={n_tanh_na_nonmono} ≡ n_nonmonotonic_anchors, flat={n_tanh_na_flat}). "
+                    "geometry: log y = a + b·tanh(c·(idx−idx0)); raw-curve anchor verify ≤1e-6 log"
+                ),
+            },
+            {
+                "item": "Geometry by sheet",
+                "detail": "Which sheet used which geometry (this run)",
+                "columns_or_notes": (
+                    f"Results: equal_log + taper_r={OUTER_TAPER_R}, interiors={'PCHIP' if pchip_on else 'equal-log'}; "
+                    f"Results_acoustics_prior: literature regularizer + same taper; "
+                    f"Results_tanh: tanh_saturating (monotone-anchor notes only); "
+                    f"CLI default use_pchip=False; GUI default use_pchip=True"
+                ),
             },
             {
                 "item": "Optional full table",
@@ -2528,7 +3247,7 @@ def export_excel(
             {
                 "item": "Diagnostics only",
                 "detail": "Holdout_*, Bootstrap_CI, Interval_calibration, Sensitivity_outer, Run_meta",
-                "columns_or_notes": "not needed for everyday use",
+                "columns_or_notes": "Sensitivity_outer includes pred_r0.7..pred_r1.0 taper columns; not needed for everyday use",
             },
         ]
     )
@@ -2537,6 +3256,7 @@ def export_excel(
         guide.to_excel(xw, sheet_name="START_HERE", index=False)
         results_df.to_excel(xw, sheet_name="Results", index=False)
         ac_df.to_excel(xw, sheet_name="Results_acoustics_prior", index=False)
+        tanh_df.to_excel(xw, sheet_name="Results_tanh", index=False)
         _acoustics_literature_df().to_excel(xw, sheet_name="Acoustics_prior_rules", index=False)
         wide.to_excel(xw, sheet_name="Predictions_10dyn", index=False)
         measured.to_excel(xw, sheet_name="Measured_anchors", index=False)
@@ -2619,7 +3339,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--pchip",
         action="store_true",
-        help="Optional PCHIP polish on intermediates from the 3 anchors (default: off)",
+        help="Optional PCHIP polish on intermediates from the 3 anchors (CLI default: off; GUI default: on)",
     )
     p.add_argument("--no-pchip", action="store_true", help=argparse.SUPPRESS)  # backward compat
     p.add_argument("--n-boot", type=int, default=BOOTSTRAP_DEFAULT)

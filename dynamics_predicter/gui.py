@@ -253,7 +253,7 @@ class App(tk.Tk):
         super().__init__()
         self.title(f"Dynamics_predicter v{__version__} — IOWA + ORCHIDEA")
         self.geometry("900x700")
-        self.use_pchip = tk.BooleanVar(value=False)
+        self.use_pchip = tk.BooleanVar(value=True)  # v1.5: GUI default on; CLI stays opt-in
         self.n_boot = tk.IntVar(value=200)
         self.panel = tk.StringVar(value=self._guess_panel())
         self.out_excel = tk.StringVar(value=str(ROOT / "outputs" / "iowa_orchidea_dynamics.xlsx"))
@@ -317,7 +317,7 @@ class App(tk.Tk):
     def _opts(self, frm, row: int) -> int:
         ttk.Checkbutton(
             frm,
-            text="Optional PCHIP on intermediates (default off = equal-log)",
+            text="PCHIP on intermediates (GUI default on; uncheck = equal-log fractions)",
             variable=self.use_pchip,
         ).grid(row=row, column=0, sticky="w", pady=(8, 0))
         row += 1

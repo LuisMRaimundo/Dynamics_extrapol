@@ -1,6 +1,6 @@
 # Literature titles (method grounding)
 
-**Scope:** IOWA+ORCHIDEA-only equal-log imputation with aligned hold-outs, conjugate EB posterior pushforward intervals on log-spans (calibrated `meas_ratio` / `cov_scale`), bootstrap diagnostics, and optional PCHIP (Philharmonia not used).
+**Scope:** IOWA+ORCHIDEA-only equal-log imputation with tapered outers (R7), optional tanh-saturating third track, aligned hold-outs, conjugate EB posterior pushforward intervals on log-spans (calibrated `meas_ratio` / `cov_scale`), bootstrap diagnostics, and optional PCHIP (Philharmonia not used). All curvature nuance stays in the same log space — no extra transform layer.
 
 | Role in method | Title | Authors | Year |
 |----------------|-------|---------|------|
@@ -29,4 +29,10 @@ Supporting acoustics (same folder / `Strings\`):
 | Violin research survey | A history of violin research | Schelleng / Cremer lineage context |
 | Absolute levels | Absolute Amplitudes and Spectra… | Spectrum ≠ free SPL scaling |
 
-Rules R0–R6 are exported on sheet `Acoustics_prior_rules`. Measured `pp`/`mf`/`ff` are never overwritten.
+Rules R0–R7 are exported on sheet `Acoustics_prior_rules`. Measured `pp`/`mf`/`ff` are never overwritten (R6). R7 cites Meyer (2009) dynamic-range compression and Patterson (1974) for outer taper `step·r^(k−1)`.
+
+**EWSD / CDM vs dynamics:** the spectral-density score is empirically non-monotone
+along the dynamic ladder for bowed strings (cello corpus: 33/49 notes with
+\(\mathrm{ff}<\mathrm{mf}\); median \(R_{\mathrm{ff}/\mathrm{mf}}\approx 0.94\)).
+Do not treat soft→loud CDM increase as a physical law; ladder tests must scope
+hygiene to imputed/extrapolated cells only (`value_kind` / `kind_*` on `Results`).
