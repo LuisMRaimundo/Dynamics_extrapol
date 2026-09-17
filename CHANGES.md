@@ -1,5 +1,16 @@
 # CHANGES
 
+## v1.5.2.2 — interval seed stability and mathematical reference
+
+- Interval Monte Carlo no longer uses Python's salted ``hash(note)``.
+  ``_stable_note_seed_offset`` is SHA-256 of the note label, so
+  ``pred_lo`` / ``pred_hi`` are reproducible across processes
+  (``PYTHONHASHSEED`` no longer moves the bands). Point ladders, acoustics
+  track, and tanh track are unchanged.
+- Mathematical reference: ``docs/Dynamics_extrapol_math_formula.md``.
+- README: install path, interval semantics, dynamic-index convention,
+  CLI/GUI entry points, external-output guidance.
+
 ## v1.5.2.1 — reconcile non-monotone accounting
 
 - Tanh guard refusal reasons are two distinct strings:

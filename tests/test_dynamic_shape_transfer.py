@@ -299,7 +299,7 @@ def test_header_map_prefers_exact_pp_over_pianissimo_alias():
 def test_package_version_export():
     import dynamics_predicter as dp
 
-    assert dp.__version__ == "1.5.2.1"
+    assert dp.__version__ == "1.5.2.2"
 
 
 def test_taper_r1_bit_exact_v14():

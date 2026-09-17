@@ -1,6 +1,8 @@
-# Dynamics_predicter (v1.5.2.1)
+# Dynamics_predicter (v1.5.2.2)
 
 **IOWA + ORCHIDEA only** — Philharmonia removed.
+
+GitHub: https://github.com/LuisMRaimundo/Dynamics_extrapol
 
 Installable research package for a 10-level dynamic ladder from measured anchors `pp`, `mf`, `ff`:
 
@@ -17,50 +19,107 @@ ff&lt;mf; median \(R_{\mathrm{ff}/\mathrm{mf}}\approx 0.94\)). Hygiene tests cov
 imputed/extrapolated cells only; measured anchors stay inviolable (`kind_*` on
 `Results`).
 
-See **[CHANGES.md](CHANGES.md)** for v1.5. Bibliographic titles: **[LITERATURE.md](LITERATURE.md)**.
+Equal spacing of the ten **labels** on an integer index $0,\ldots,9$ is a
+**modeling convention**, not a physical or musicological claim that successive
+dynamic marks are equal in amplitude, power, or decibels.
+
+See **[CHANGES.md](CHANGES.md)** for the changelog. Bibliographic titles:
+**[LITERATURE.md](LITERATURE.md)**. Formulae extracted from the implementation:
+**[docs/Dynamics_extrapol_math_formula.md](docs/Dynamics_extrapol_math_formula.md)**.
 
 ## Install
 
+Requires Python 3.10+. From this repository root (the folder that contains
+`pyproject.toml`):
+
 ```bash
-cd Dynamics_predicter
-pip install -e ".[dev]"
+python -m venv .venv
+.venv\Scripts\pip install -e ".[dev]"
 ```
+
+Declared dependencies: `numpy>=1.22`, `pandas>=1.5`, `openpyxl>=3.1`,
+`scipy>=1.9`; tests also need `pytest>=7.0`. Do not upgrade global site-packages
+for this project.
 
 ## Method
 
-1. Header-aware load of IOWA+ORCHIDEA `pp` / `mf` / `ff`.
-2. Equal-log fractions inside segments (`p` ⅓, `mp` ⅔, `f` ½); optional PCHIP (**GUI default on**, CLI `--pchip` opt-in).
-3. Outer levels via tapered segment log-steps `step·r^(k−1)` (default `r=0.80`; `r=1.0` = v1.4) + light corpus pooling when spans are tiny.
-4. **Intervals:** hierarchical Gaussian on \(\theta=(D_{\mathrm{lo}},D_{\mathrm{hi}})\):
-   - \(\theta\mid r\sim\mathcal{N}(\mu_r,\Sigma_{\mathrm{within}})\)
-   - \(y\mid\theta\sim\mathcal{N}(\theta,\Sigma_{\mathrm{meas}})\)
-   - conjugate posterior pushforward through equal-log
-   - `cov_scale` / `meas_ratio` calibrated to nominal LOO coverage
-5. `Sensitivity_outer` (±20% steps **and** `r∈{0.7,0.8,0.9,1.0}`) is **not** a CI.
-6. Aligned hold-outs + baselines; bootstrap on corpus ratios / hold-out MAE.
-7. Third track `Results_tanh`: `log y = a + b·tanh(c·(idx−idx0))` — never the default.
+1. Header-aware load of IOWA+ORCHIDEA `pp` / `mf` / `ff` (strictly positive).
+2. Work in **natural log** of the recorded metric (not dB, not log10).
+3. Equal-log fractions inside segments (`p` ⅓, `mp` ⅔, `f` ½); optional PCHIP
+   (**GUI default on**, CLI `--pchip` opt-in). PCHIP does not change the
+   literature second track, which always uses equal-log interiors.
+4. Outer levels via tapered segment log-steps `step·r^(k−1)` (default
+   `r=0.80`; `r=1.0` = v1.4) + light corpus pooling when spans are tiny.
+5. **Intervals on `Results`:** conjugate empirical-Bayes posterior of
+   $\theta=(D_{\mathrm{lo}},D_{\mathrm{hi}})$, then Monte Carlo pushforward
+   through the equal-log ladder. Label: `eb_gaussian_posterior_pushforward`.
+   These are **not** laboratory measurement-error bars and **not** the
+   `Sensitivity_outer` table. Measured anchors are reported exact
+   (`lo = hi = measured`).
+6. `Sensitivity_outer` (±20% outer steps **and** `r∈{0.7,0.8,0.9,1.0}`) is
+   **not** a confidence or prediction interval.
+7. Hold-outs + baselines; bootstrap on corpus ratios / hold-out MAE.
+8. Third track `Results_tanh`: $\log y = a + b\cdot\tanh(c\cdot(\mathrm{idx}-\mathrm{idx}_0))$
+   — never the default.
 
 ## Run
 
+Prefer an output path **outside** this repository so generated workbooks do
+not sit next to source. The CLI default
+`outputs/iowa_orchidea_dynamics.xlsx` is gitignored (`*.xlsx`) but still
+inside the tree.
+
 ```bash
-python -m dynamics_predicter
-dynamics-predicter --n-boot 200
+python -m dynamics_predicter --paste-file panel.txt --out C:\path\out.xlsx --n-boot 200
+dynamics-predicter --panel path\to\panel.xlsx --out C:\path\out.xlsx
 dynamics-predicter-gui
 python -m pytest -q
 ```
 
-Legacy shims (still work): `python dynamic_shape_transfer.py`, `start.bat`.
+Without `--panel` or `--paste-file`, the CLI looks for a dynamics workbook
+under the machine-local folder `C:\Users\lmr20\Desktop\Violino - extrapol`.
+That path is not portable; pass `--panel` explicitly on other machines.
+
+GUI: `start.bat` or `python run_gui.py`. Excel tab uses a column mapper;
+Paste tab accepts `note pp mf ff`. GUI default: PCHIP on, bootstrap 200.
+Default GUI output paths are under this repo's `outputs\` folder — browse
+to an external directory for research-safe exports.
+
+Legacy shims (still work): `python dynamic_shape_transfer.py`, `Paste-Dynamics.bat`.
+
+Batch helpers `run_all_instruments_batch.py` and
+`run_para_dinamicas_folder.py` walk **local** Desktop corpora. They do not
+overwrite source workbooks. Do not treat them as the portable public API.
+
+## Input / output
+
+**Input metric:** whatever positive number is in the `pp` / `mf` / `ff`
+columns (typically an EWSD-like / CDM spectral-density score). The code does
+not convert to SPL or decibels.
+
+**Invalid input:** non-positive or non-finite anchors are rejected at parse /
+load, or a note is skipped as `skipped_target` / `skipped_incomplete`.
+
+**Output workbook sheets:** `START_HERE`, green **`Results`** (data-faithful
+equal-log + taper), purple **`Results_acoustics_prior`**, terracotta
+**`Results_tanh`**, plus diagnostics listed below. Historical research
+workbooks are not regenerated by this package's tests.
+
+Also: `Predictions_10dyn`, `Measured_anchors`, `Interpolated`, `Extrapolated`,
+`Quality_flags`, `Holdout_*`, `Bootstrap_CI`, `Interval_calibration`,
+`Sensitivity_outer`, `Limitations`, `Literature`, `Run_meta`.
+
+## Reproducibility
+
+- Default RNG seed: `20260801`. CLI: `--seed`.
+- Interval draws (v1.5.2.2+): `seed + SHA256(note) mod 10007`.
+- Bootstrap uses the same seed independently of the interval streams.
 
 ## CI
 
 GitHub Actions: `.github/workflows/ci.yml` — pytest on Python 3.10–3.12.
 
-## Output sheets
+## Validation (this review)
 
-Primary: `START_HERE`, green **`Results`** (data-faithful equal-log + taper).
-
-Literature second track: purple **`Results_acoustics_prior`** + **`Acoustics_prior_rules`** (R0–R7; primary book Rossing *The Science of String Instruments*).
-
-Third track: terracotta **`Results_tanh`** (`ladder_mode=tanh_saturating`; never default).
-
-Also: `Predictions_10dyn`, `Measured_anchors`, `Interpolated`, `Extrapolated`, `Quality_flags`, `Holdout_*`, `Bootstrap_CI`, `Interval_calibration`, `Sensitivity_outer`, `Limitations`, `Literature`, `Run_meta`.
+Synthetic fixtures and the existing unit suite. The full research corpus was
+**not** rerun. See the mathematical reference for coverage and limitations.
