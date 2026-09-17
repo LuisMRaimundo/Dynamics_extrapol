@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dynamics-predicter"
-version = "1.5.2.1"
+version = "1.5.2.2"
 description = "IOWA+ORCHIDEA equal-log dynamic imputation with tapered outers, tanh track, EB intervals"
 readme = "README.md"
 requires-python = ">=3.10"

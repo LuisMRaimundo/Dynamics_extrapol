@@ -43,7 +43,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from scipy.interpolate import PchipInterpolator
 
-__version__ = "1.5.2.1"
+__version__ = "1.5.2.2"
 
 DYN_ORDER = ("pppp", "ppp", "pp", "p", "mp", "mf", "f", "ff", "fff", "ffff")
 DYN_LEVEL = {d: float(i) for i, d in enumerate(DYN_ORDER)}
@@ -830,6 +830,16 @@ def file_sha256(path: Path, chunk: int = 1 << 20) -> str:
                 break
             h.update(b)
     return h.hexdigest()
+
+
+def _stable_note_seed_offset(note: str, *, modulus: int = 10007) -> int:
+    """Process-stable offset so interval draws do not depend on PYTHONHASHSEED.
+
+    ``hash(note)`` is salted per interpreter unless PYTHONHASHSEED is fixed,
+    which made ``pred_lo`` / ``pred_hi`` non-reproducible across runs.
+    """
+    digest = hashlib.sha256(str(note).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % int(modulus)
 
 
 def is_dynamics_panel_filename(path: str | Path) -> bool:
@@ -2139,7 +2149,7 @@ def transfer_one_note(
             corpus_geom=corpus_geom,
             n_draws=n_pushforward,
             alpha=interval_alpha,
-            seed=seed + (abs(hash(note_for_oct)) % 10007),
+            seed=seed + _stable_note_seed_offset(note_for_oct),
             outer_taper_r=outer_taper_r,
         )
         audit.update(imeta)
